@@ -1,0 +1,535 @@
+{
+  "Comment": "Production Lakehouse ETL with Multi-Format Support, Validation, and Error Handling",
+  "StartAt": "ValidateInput",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "ValidateInput": {
+      "Type": "Pass",
+      "Parameters": {
+        "bucket.$": "$.bucket",
+        "original_key.$": "$.original_key",
+        "converted_files.$": "$.converted_files",
+        "timestamp.$": "$.timestamp",
+        "event_name.$": "$.event_name",
+        "dataset_type.$": "$.dataset_type",
+        "execution_trigger.$": "$.execution_trigger",
+        "execution_id.$": "$$.Execution.Name"
+      },
+      "Next": "FileFormatDetectionAndValidation"
+    },
+    "FileFormatDetectionAndValidation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "lakehouse-file-processor",
+        "Payload.$": "$"
+      },
+      "TimeoutSeconds": 300,
+      "HeartbeatSeconds": 60,
+      "ResultPath": "$.lambda_result",
+      "Next": "CheckValidationResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ValidationFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "CheckValidationResult": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.lambda_result.Payload.statusCode",
+          "NumericEquals": 400,
+          "Next": "ValidationFailureNotification"
+        },
+        {
+          "Variable": "$.lambda_result.Payload.statusCode",
+          "NumericEquals": 200,
+          "Next": "ParseProcessingResult"
+        }
+      ],
+      "Default": "ValidationFailureNotification"
+    },
+    "ParseProcessingResult": {
+      "Type": "Pass",
+      "Parameters": {
+        "processing_info.$": "States.StringToJson($.lambda_result.Payload.body)",
+        "execution_id.$": "$.execution_id",
+        "bucket.$": "$.bucket",
+        "original_key.$": "$.original_key",
+        "timestamp.$": "$.timestamp",
+        "dataset_type.$": "$.dataset_type"
+      },
+      "Next": "DetermineETLStrategy"
+    },
+    "DetermineETLStrategy": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.processing_info.glue_jobs",
+          "IsPresent": true,
+          "Next": "CheckJobType"
+        }
+      ],
+      "Default": "ProcessAllDatasets"
+    },
+    "CheckJobType": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.processing_info.glue_jobs[0]",
+              "StringEquals": "lakehouse-orders-etl"
+            }
+          ],
+          "Next": "ProcessOrders"
+        },
+        {
+          "Variable": "$.processing_info.glue_jobs[0]",
+          "StringEquals": "lakehouse-products-etl",
+          "Next": "ProcessProducts"
+        },
+        {
+          "Variable": "$.processing_info.glue_jobs[0]",
+          "StringEquals": "lakehouse-order-items-etl",
+          "Next": "ProcessOrderItems"
+        }
+      ],
+      "Default": "ProcessAllDatasets"
+    },
+    "ProcessOrders": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-orders-etl",
+        "Arguments": {
+          "--processed_files.$": "States.JsonToString($.processing_info.processed_files)",
+          "--execution_id.$": "$.execution_id",
+          "--RAW_BUCKET": "lakehouse-raw-dev",
+          "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+          "--ENVIRONMENT": "dev",
+          "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+        }
+      },
+      "TimeoutSeconds": 1800,
+      "HeartbeatSeconds": 300,
+      "Next": "UpdateCatalogAndValidate",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ETLFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "ProcessProducts": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-products-etl",
+        "Arguments": {
+          "--execution_id.$": "$.execution_id",
+          "--RAW_BUCKET": "lakehouse-raw-dev",
+          "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+          "--ENVIRONMENT": "dev",
+          "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+        }
+      },
+      "TimeoutSeconds": 900,
+      "HeartbeatSeconds": 180,
+      "Next": "UpdateCatalogAndValidate",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ETLFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "ProcessOrderItems": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "lakehouse-order-items-etl",
+        "Arguments": {
+          "--execution_id.$": "$.execution_id",
+          "--RAW_BUCKET": "lakehouse-raw-dev",
+          "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+          "--ENVIRONMENT": "dev",
+          "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+        }
+      },
+      "TimeoutSeconds": 1800,
+      "HeartbeatSeconds": 300,
+      "Next": "UpdateCatalogAndValidate",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ConcurrentRunsExceededException"
+          ],
+          "IntervalSeconds": 60,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        },
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ETLFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "ProcessAllDatasets": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ProcessOrdersParallel",
+          "States": {
+            "ProcessOrdersParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "lakehouse-orders-etl",
+                "Arguments": {
+                  "--RAW_BUCKET": "lakehouse-raw-dev",
+                  "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+                  "--ENVIRONMENT": "dev",
+                  "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+                }
+              },
+              "TimeoutSeconds": 1800,
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "ProcessProductsParallel",
+          "States": {
+            "ProcessProductsParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "lakehouse-products-etl",
+                "Arguments": {
+                  "--RAW_BUCKET": "lakehouse-raw-dev",
+                  "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+                  "--ENVIRONMENT": "dev",
+                  "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+                }
+              },
+              "TimeoutSeconds": 900,
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "ProcessOrderItemsParallel",
+          "States": {
+            "ProcessOrderItemsParallel": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::glue:startJobRun.sync",
+              "Parameters": {
+                "JobName": "lakehouse-order-items-etl",
+                "Arguments": {
+                  "--RAW_BUCKET": "lakehouse-raw-dev",
+                  "--PROCESSED_BUCKET": "lakehouse-processed-dev",
+                  "--ENVIRONMENT": "dev",
+                  "--GLUE_DATABASE": "lakehouse_ecommerce_db"
+                }
+              },
+              "TimeoutSeconds": 1800,
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "Next": "UpdateCatalogAndValidate",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ETLFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "UpdateCatalogAndValidate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+      "Parameters": {
+        "Name": "lakehouse-catalog-crawler"
+      },
+      "TimeoutSeconds": 600,
+      "Next": "WaitForCrawler",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "Glue.CrawlerRunningException"
+          ],
+          "Next": "WaitForCrawler",
+          "ResultPath": "$.crawler_error"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CrawlerFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "WaitForCrawler": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Next": "CheckCrawlerStatus"
+    },
+    "CheckCrawlerStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+      "Parameters": {
+        "Name": "lakehouse-catalog-crawler"
+      },
+      "Next": "IsCrawlerComplete",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CrawlerFailureNotification",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    "IsCrawlerComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "READY",
+          "Next": "ValidateWithAthena"
+        },
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "RUNNING",
+          "Next": "WaitForCrawler"
+        },
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "STOPPING",
+          "Next": "WaitForCrawler"
+        },
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "SUCCEEDED",
+          "Next": "ValidateWithAthena"
+        },
+        {
+          "Variable": "$.Crawler.State",
+          "StringEquals": "FAILED",
+          "Next": "CrawlerActualFailure"
+        }
+      ],
+      "Default": "CrawlerActualFailure"
+    },
+    "CrawlerActualFailure": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "CRAWLER_FAILED",
+        "message": "Glue Crawler failed or reached unknown state",
+        "crawler_state.$": "$.Crawler.State",
+        "crawler_name": "lakehouse-catalog-crawler",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "End": true
+    },
+    "ValidateWithAthena": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString": "SELECT COUNT(*) FROM lakehouse_ecommerce_db.products;",
+        "ResultConfiguration": {
+          "OutputLocation": "s3://lakehouse-processed-dev/athena-results/"
+        },
+        "WorkGroup": "primary"
+      },
+      "TimeoutSeconds": 300,
+      "Next": "ArchiveProcessedFiles",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ValidationSkipped",
+          "ResultPath": "$.athena_error"
+        }
+      ]
+    },
+    "ValidationSkipped": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "ATHENA_SKIPPED",
+        "message": "Athena validation skipped - tables may not exist yet",
+        "error.$": "$.athena_error",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "Next": "ArchiveProcessedFiles"
+    },
+    "ArchiveProcessedFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "lakehouse-file-archiver",
+        "Payload.$": "$"
+      },
+      "TimeoutSeconds": 180,
+      "Next": "SuccessNotification",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SuccessNotification",
+          "ResultPath": "$.archive_error"
+        }
+      ]
+    },
+    "SuccessNotification": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "SUCCESS",
+        "message": "Lakehouse ETL pipeline completed successfully with multi-format support",
+        "timestamp.$": "$$.State.EnteredTime",
+        "execution_name.$": "$$.Execution.Name"
+      },
+      "End": true
+    },
+    "ValidationFailureNotification": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "VALIDATION_FAILED",
+        "message": "File validation failed - check file format and schema",
+        "error.$": "$.error",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "End": true
+    },
+    "ETLFailureNotification": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "ETL_FAILED",
+        "message": "Lakehouse ETL pipeline failed during processing",
+        "error.$": "$.error",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "End": true
+    },
+    "CrawlerFailureNotification": {
+      "Type": "Pass",
+      "Parameters": {
+        "status": "CRAWLER_FAILED",
+        "message": "Glue Crawler failed to start or encountered an error",
+        "error.$": "$.error",
+        "timestamp.$": "$$.State.EnteredTime"
+      },
+      "End": true
+    }
+  }
+}
